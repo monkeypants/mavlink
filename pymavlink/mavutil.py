@@ -7,8 +7,26 @@ Released under GNU GPL version 3 or later
 '''
 
 import socket, math, struct, time, os, fnmatch, array, sys, errno
+
+# adding these extra imports allows pymavlink to be used directly with pyinstaller
+# without having complex spec files
+import json
+from pymavlink.dialects.v10 import ardupilotmega
+
+# these imports allow for mavgraph and mavlogdump to use maths expressions more easily
 from math import *
 from mavextra import *
+
+'''
+Support having a $HOME/.pymavlink/mavextra.py for extra graphing functions
+'''
+home = os.getenv('HOME')
+if home is not None:
+    extra = os.path.join(home, '.pymavlink', 'mavextra.py')
+    if os.path.exists(extra):
+        import imp
+        mavuser = imp.load_source('pymavlink.mavuser', extra)
+        from pymavlink.mavuser import *
 
 mavlink = None
 
@@ -509,9 +527,18 @@ class mavfile(object):
             MAV_ACTION_CALIBRATE_PRESSURE = 20
             self.mav.action_send(self.target_system, self.target_component, MAV_ACTION_CALIBRATE_PRESSURE)
 
-    def reboot_autopilot(self):
+    def reboot_autopilot(self, hold_in_bootloader=False):
         '''reboot the autopilot'''
         if self.mavlink10():
+            if hold_in_bootloader:
+                param1 = 3
+            else:
+                param1 = 1
+            self.mav.command_long_send(self.target_system, self.target_component,
+                                       mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN, 0,
+                                       param1, 0, 0, 0, 0, 0, 0)
+            # send an old style reboot immediately afterwards in case it is an older firmware
+            # that doesn't understand the new convention
             self.mav.command_long_send(self.target_system, self.target_component,
                                        mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN, 0,
                                        1, 0, 0, 0, 0, 0, 0)
@@ -912,6 +939,23 @@ def mavlink_connection(device, baud=115200, source_system=255,
     if device.startswith('udp:'):
         return mavudp(device[4:], input=input, source_system=source_system)
 
+    if device.endswith('.bin'):
+        # support dataflash logs
+        from pymavlink import DFReader
+        m = DFReader.DFReader_binary(device)
+        global mavfile_global
+        mavfile_global = m
+        return m
+
+    if device.endswith('.log'):
+        # support dataflash text logs
+        from pymavlink import DFReader
+        if DFReader.DFReader_is_text_log(device):
+            global mavfile_global
+            m = DFReader.DFReader_text(device)
+            mavfile_global = m
+            return m    
+
     # list of suffixes to prevent setting DOS paths as UDP sockets
     logsuffixes = [ 'log', 'raw', 'tlog' ]
     suffix = device.split('.')[-1].lower()
@@ -1128,7 +1172,7 @@ def mode_string_v10(msg):
     '''mode string for 1.0 protocol, from heartbeat'''
     if not msg.base_mode & mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED:
         return "Mode(0x%08x)" % msg.base_mode
-    if msg.type == mavlink.MAV_TYPE_QUADROTOR:
+    if msg.type in [ mavlink.MAV_TYPE_QUADROTOR, mavlink.MAV_TYPE_HEXAROTOR, mavlink.MAV_TYPE_OCTOROTOR, mavlink.MAV_TYPE_TRICOPTER, mavlink.MAV_TYPE_COAXIAL ]:
         if msg.custom_mode in mode_mapping_acm:
             return mode_mapping_acm[msg.custom_mode]
     if msg.type == mavlink.MAV_TYPE_FIXED_WING:
@@ -1139,6 +1183,11 @@ def mode_string_v10(msg):
             return mode_mapping_rover[msg.custom_mode]
     return "Mode(%u)" % msg.custom_mode
 
+def mode_string_apm(mode_number):
+    '''return mode string for APM:Plane'''
+    if mode_number in mode_mapping_apm:
+        return mode_mapping_apm[mode_number]
+    return "Mode(%u)" % mode_number
     
 
 class x25crc(object):

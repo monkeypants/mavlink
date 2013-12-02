@@ -1,7 +1,7 @@
 from distutils.core import setup, Extension
 import glob, os, shutil
 
-version = '1.1.5'
+version = '1.1.11'
 
 from generator import mavgen, mavparse
 
@@ -70,5 +70,7 @@ setup (name = 'pymavlink',
                    'tools/mavgpslock.py',
                    'tools/mavmission.py',
                    'tools/mavsigloss.py',
+                   'tools/mavsearch.py',
+                   'tools/mavtomfile.py',
                    'generator/mavgen.py']
        )
