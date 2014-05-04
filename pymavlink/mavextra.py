@@ -444,7 +444,12 @@ def pitch_sim(SIMSTATE, GPS_RAW):
 
 def distance_two(GPS_RAW1, GPS_RAW2):
     '''distance between two points'''
-    if hasattr(GPS_RAW1, 'cog'):
+    if hasattr(GPS_RAW1, 'Lat'):
+        lat1 = radians(GPS_RAW1.Lat)
+        lat2 = radians(GPS_RAW2.Lat)
+        lon1 = radians(GPS_RAW1.Lng)
+        lon2 = radians(GPS_RAW2.Lng)
+    elif hasattr(GPS_RAW1, 'cog'):
         lat1 = radians(GPS_RAW1.lat)*1.0e-7
         lat2 = radians(GPS_RAW2.lat)*1.0e-7
         lon1 = radians(GPS_RAW1.lon)*1.0e-7
@@ -745,3 +750,150 @@ def DCM_update(IMU, ATT, MAG, GPS):
     accel2 = Vector3(IMU.AccX, IMU.AccY, IMU.AccZ)
     dcm_state.update(gyro, accel, mag, GPS)
     return dcm_state
+
+class PX4_State(object):
+    '''PX4 DCM state object'''
+    def __init__(self, roll, pitch, yaw, timestamp):
+        self.dcm = Matrix3()
+        self.dcm.from_euler(radians(roll), radians(pitch), radians(yaw))
+        self.gyro = Vector3()
+        self.accel = Vector3()
+        self.timestamp = timestamp
+        (self.roll, self.pitch, self.yaw) = self.dcm.to_euler()
+        
+    def update(self, gyro, accel, timestamp):
+        if self.gyro != gyro or self.accel != accel:
+            delta_angle = gyro * (timestamp - self.timestamp)
+            self.timestamp = timestamp
+            self.dcm.rotate(delta_angle)
+            self.dcm.normalize()
+            self.gyro = gyro
+            self.accel = accel
+            (self.roll, self.pitch, self.yaw) = self.dcm.to_euler()
+
+px4_state = None
+
+def PX4_update(IMU, ATT):
+    '''implement full DCM using PX4 native SD log data'''
+    global px4_state
+    if px4_state is None:
+        px4_state = PX4_State(degrees(ATT.Roll), degrees(ATT.Pitch), degrees(ATT.Yaw), IMU._timestamp)
+
+    gyro  = Vector3(IMU.GyroX, IMU.GyroY, IMU.GyroZ)
+    accel = Vector3(IMU.AccX, IMU.AccY, IMU.AccZ)
+    px4_state.update(gyro, accel, IMU._timestamp)
+    return px4_state
+
+_downsample_N = 0
+
+def downsample(N):
+    '''conditional that is true on every Nth sample'''
+    global _downsample_N
+    _downsample_N = (_downsample_N + 1) % N
+    return _downsample_N == 0
+
+def armed(HEARTBEAT):
+    '''return 1 if armed, 0 if not'''
+    from pymavlink import mavutil
+    if HEARTBEAT.type == mavutil.mavlink.MAV_TYPE_GCS:
+        self = mavutil.mavfile_global
+        if self.motors_armed():
+            return 1
+        return 0
+    if HEARTBEAT.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
+        return 1
+    return 0
+
+def rotation_df(ATT):
+    '''return the current DCM rotation matrix'''
+    r = Matrix3()
+    r.from_euler(radians(ATT.Roll), radians(ATT.Pitch), radians(ATT.Yaw))
+    return r
+
+def rotation2(AHRS2):
+    '''return the current DCM rotation matrix'''
+    r = Matrix3()
+    r.from_euler(AHRS2.roll, AHRS2.pitch, AHRS2.yaw)
+    return r
+
+def earth_accel2(RAW_IMU,ATTITUDE):
+    '''return earth frame acceleration vector from AHRS2'''
+    r = rotation2(ATTITUDE)
+    accel = Vector3(RAW_IMU.xacc, RAW_IMU.yacc, RAW_IMU.zacc) * 9.81 * 0.001
+    return r * accel
+
+def earth_accel_df(IMU,ATT):
+    '''return earth frame acceleration vector from df log'''
+    r = rotation_df(ATT)
+    accel = Vector3(IMU.AccX, IMU.AccY, IMU.AccZ)
+    return r * accel
+
+def earth_accel2_df(IMU,IMU2,ATT):
+    '''return earth frame acceleration vector from df log'''
+    r = rotation_df(ATT)
+    accel1 = Vector3(IMU.AccX, IMU.AccY, IMU.AccZ)
+    accel2 = Vector3(IMU2.AccX, IMU2.AccY, IMU2.AccZ)
+    accel = 0.5 * (accel1 + accel2)
+    return r * accel
+
+def gps_velocity_df(GPS):
+    '''return GPS velocity vector'''
+    vx = GPS.Spd * cos(radians(GPS.GCrs))
+    vy = GPS.Spd * sin(radians(GPS.GCrs))
+    return Vector3(vx, vy, GPS.VZ)
+
+def distance_gps2(GPS, GPS2):
+    '''distance between two points'''
+    if GPS.TimeMS != GPS2.TimeMS:
+        # reject messages not time aligned
+        return None
+    return distance_two(GPS, GPS2)
+
+
+radius_of_earth = 6378100.0 # in meters
+
+def wrap_valid_longitude(lon):
+  ''' wrap a longitude value around to always have a value in the range
+      [-180, +180) i.e 0 => 0, 1 => 1, -1 => -1, 181 => -179, -181 => 179
+  '''
+  return (((lon + 180.0) % 360.0) - 180.0)
+
+def gps_newpos(lat, lon, bearing, distance):
+	'''extrapolate latitude/longitude given a heading and distance
+	thanks to http://www.movable-type.co.uk/scripts/latlong.html
+	'''
+        import math
+	lat1 = math.radians(lat)
+	lon1 = math.radians(lon)
+	brng = math.radians(bearing)
+	dr = distance/radius_of_earth
+
+	lat2 = math.asin(math.sin(lat1)*math.cos(dr) +
+                         math.cos(lat1)*math.sin(dr)*math.cos(brng))
+	lon2 = lon1 + math.atan2(math.sin(brng)*math.sin(dr)*math.cos(lat1), 
+                                 math.cos(dr)-math.sin(lat1)*math.sin(lat2))
+	return (math.degrees(lat2), wrap_valid_longitude(math.degrees(lon2)))
+
+def gps_offset(lat, lon, east, north):
+	'''return new lat/lon after moving east/north
+	by the given number of meters'''
+        import math
+	bearing = math.degrees(math.atan2(east, north))
+	distance = math.sqrt(east**2 + north**2)
+	return gps_newpos(lat, lon, bearing, distance)
+
+ekf_home = None
+
+def ekf1_pos(EKF1):
+    '''calculate EKF position when EKF disabled'''
+    global ekf_home
+    from pymavlink import mavutil
+    self = mavutil.mavfile_global
+    if ekf_home is None:
+        if not 'GPS' in self.messages or self.messages['GPS'].Status != 3:
+            return None
+        ekf_home = self.messages['GPS']
+        (ekf_home.Lat, ekf_home.Lng) = gps_offset(ekf_home.Lat, ekf_home.Lng, -EKF1.PE, -EKF1.PN)
+    (lat,lon) = gps_offset(ekf_home.Lat, ekf_home.Lng, EKF1.PE, EKF1.PN)
+    return (lat, lon)
+
